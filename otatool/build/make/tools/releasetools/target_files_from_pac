@@ -1,0 +1,941 @@
+#!/usr/bin/env python
+
+"""
+Given a sprd pac file or a directory contains images, radios, and other
+files which used to flash to phone, produces an zip package called target
+file which used for build update package.
+
+Usage:  target_files_from_pac [-j project_name]  pac_file target_file
+
+  -j  <name>
+      enter the project name(include sharkl5/sharkle/sharkl3/sharkl5pro/pike2 now) to get key infos for this porject.
+
+"""
+
+import sys
+
+if sys.hexversion < 0x02070000:
+  print >> sys.stderr, "Python 2.7 or newer is required."
+  sys.exit(1)
+
+import copy
+import errno
+import os
+import re
+import sha
+import subprocess
+import tempfile
+import struct
+import time
+import zipfile
+import gzip
+import shutil
+import xml.dom.minidom
+from xml.dom import minidom, Node
+
+try:
+  from hashlib import sha1 as sha1
+except ImportError:
+  from sha import sha as sha1
+
+import common
+import edify_generator
+
+OPTIONS = common.OPTIONS
+OPTIONS.misc_info = None
+OPTIONS.ota_bin = None
+#OPTIONS.prj_go = False
+OPTIONS.recovery_fstab = None
+OPTIONS.android_info = None
+OPTIONS.input_is_pac = True
+OPTIONS.project_name = None
+OPTIONS.device_dir = "device/sprd"
+OPTIONS.project_common = None
+OPTIONS.vendor_specify_tool = None
+OPTIONS.worker_threads = 3
+OPTIONS.gen_target_zip = False
+#OPTIONS.ext4_sparse = False
+
+OPTIONS.partition_list = []
+OPTIONS.input_files = []
+
+class PartitionNode(object):
+  def __init__(self,name,size,pos):
+    self.name=name
+    self.size=size
+    self.pos=pos
+    self.backupflag = 0
+
+class PartitionScanner(object):
+  def __init__(self,doc, partition_list):
+    for pl in doc.childNodes :
+      if pl.nodeType == Node.ELEMENT_NODE and pl.tagName == "ProductList" :
+        for product in pl.childNodes:
+          if product.nodeType == Node.ELEMENT_NODE and product.tagName == "Product":
+            for partitions in product.childNodes:
+              if partitions.nodeType == Node.ELEMENT_NODE and partitions.tagName == "Partitions":
+                self.handle_partition(partitions, partition_list)
+
+  def handle_partition(self, partitions, partition_list):
+    pos = 1;
+    for partition in partitions.childNodes:
+      if partition.nodeType == Node.ELEMENT_NODE :
+        part_name = partition.getAttribute("id")
+        part_size = partition.getAttribute("size")
+        part_pos = pos;
+        part = PartitionNode(part_name, part_size, part_pos)
+        partition_list.append(part)
+        pos = pos + 1
+
+def ParseXml(ptb_xml_file, partition_list):
+  print"parse start!"
+  xml_data = open(ptb_xml_file).read()
+  doc = minidom.parseString(xml_data)
+  for child in doc.childNodes :
+    if child.nodeType == Node.ELEMENT_NODE:
+      PartitionScanner(child, partition_list)
+  for p in partition_list:
+    print "part_name:%s, part_size=%s, part_pos=%s\n"%(p.name, p.size, p.pos)
+
+
+class InputFile:
+  def __init__(self, name, need):
+    self.name = name
+    self.need = need
+
+def CommonRunWithErrStr(args, errorstr=None, runcwd=None, stdindata=None):
+  if runcwd is None:
+    p = common.Run(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  else:
+    p = common.Run(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=runcwd)
+  if stdindata is None:
+    stdoutdata, stderrdata = p.communicate()
+  else:
+    stdoutdata, stderrdata = p.communicate(stdindata)
+
+  if OPTIONS.verbose:
+    print("return code is %d\n" % p.returncode);
+
+  if p.returncode != 0 and errorstr is not None:
+    raise common.ExternalError("%s:%s" % (errorstr,stderrdata))
+
+  if OPTIONS.verbose:
+    print ("I:%s" % (stdoutdata,))
+    print ("E:%s" % (stderrdata,))
+
+  return stdoutdata, stderrdata
+
+def LoadDictionaryFromLines(lines):
+  d = {}
+  for line in lines:
+    line = line.strip()
+    if not line or line.startswith("#"):
+      continue
+    if "=" in line:
+      name, value = line.split("=", 1)
+      d[name] = value
+  return d
+
+def LoadRecoveryFSTab(fstab_version, recovery_fstab_path,
+                      system_root_image=False):
+  class Partition(object):
+    def __init__(self, mount_point, fs_type, device, length, context):
+      self.mount_point = mount_point
+      self.fs_type = fs_type
+      self.device = device
+      self.length = length
+      self.context = context
+
+  try:
+    data = open(recovery_fstab_path).read()
+  except KeyError:
+    print("Warning: could not find {}".format(recovery_fstab_path))
+    data = ""
+
+  assert fstab_version == 2
+
+  d = {}
+  for line in data.split("\n"):
+    line = line.strip()
+    if not line or line.startswith("#"):
+      continue
+
+    # <src> <mnt_point> <type> <mnt_flags and options> <fs_mgr_flags>
+    pieces = line.split()
+    if len(pieces) != 5:
+      raise ValueError("malformed recovery.fstab line: \"%s\"" % (line,))
+
+    # Ignore entries that are managed by vold.
+    options = pieces[4]
+    if "voldmanaged=" in options:
+      continue
+
+    # It's a good line, parse it.
+    length = 0
+    options = options.split(",")
+    for i in options:
+      if i.startswith("length="):
+        length = int(i[7:])
+      else:
+        # Ignore all unknown options in the unified fstab.
+        continue
+
+    mount_flags = pieces[3]
+    # Honor the SELinux context if present.
+    context = None
+    for i in mount_flags.split(","):
+      if i.startswith("context="):
+        context = i
+
+    mount_point = pieces[1]
+    d[mount_point] = Partition(mount_point=mount_point, fs_type=pieces[2],
+                               device=pieces[0], length=length, context=context)
+
+  # / is used for the system mount point when the root directory is included in
+  # system. Other areas assume system is always at "/system" so point /system
+  # at /.
+  if system_root_image:
+    assert not d.has_key("/system") and d.has_key("/")
+    d["/system"] = d["/"]
+  return d
+
+
+
+def RenameAndCopyModemFiles():
+  file_list = os.listdir(OPTIONS.input_dir)
+  print "www all files in pac:"
+  for file_wwww in file_list:
+    print ("                             %s"%(file_wwww))
+  print "\n"
+  for file_name in file_list:
+    dest_modem_path = []
+    src_modem_path = []
+    if OPTIONS.project_name == "pike2":
+      mode_name = "w"
+    else:
+      mode_name = "lte"
+
+    if ".dat" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, mode_name+"modem.bin")
+    elif "LTEA_DSP" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, mode_name+"dsp.bin")
+    elif "AGCP_DSP" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, mode_name+"agdsp.bin")
+    elif "CDMA_DSP" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, mode_name+"cdsp.bin")
+    elif "DM_DSP" in file_name:
+      if OPTIONS.project_name == "isharkl2":
+        dest_modem_path = os.path.join(OPTIONS.tmp_radio, mode_name+"tgdsp.bin")
+      else:
+        dest_modem_path = os.path.join(OPTIONS.tmp_radio, mode_name+"gdsp.bin")
+    elif "deltanv" in file_name:
+      if not OPTIONS.project_name == "isharkl2":
+        dest_modem_path = os.path.join(OPTIONS.tmp_radio, mode_name+"deltanv.bin")
+    elif "nvitem" in file_name:
+      if "3595A" in file_name:
+        if "3595AL" in file_name:
+          dest_modem_path = os.path.join(OPTIONS.tmp_radio, mode_name+"nvitem_navajo.bin")
+        else:
+          dest_modem_path = os.path.join(OPTIONS.tmp_radio, mode_name+"nvitem_boca.bin")
+      else:
+        dest_modem_path = os.path.join(OPTIONS.tmp_radio, mode_name+"nvitem.bin")
+    elif ("cm4" in file_name and "PM" not in file_name) or "arm7" in file_name :
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "pmsys.bin")
+    elif "gnssmodem" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "gnssmodem.bin")
+    elif "gnssbdmodem" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "gnssbdmodem.bin")
+    elif "EXEC_KERNEL_IMAGE" in file_name or "PM" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "wcnmodem.bin")
+    elif "vbmeta-sign.img" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "vbmeta.img")
+    elif "vbmeta_system.img" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "vbmeta_system.img")
+    elif "vbmeta_vendor.img" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "vbmeta_vendor.img")
+    elif "tos" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "tos.bin")
+    elif "sml" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "sml.bin")
+    elif "teecfg" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "teecfg.bin")
+    elif "dtb.img" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "dtb.img")
+    elif "dtbo.img" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "dtbo.img")
+    elif "xml" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "partition.xml")
+    elif "u-boot" in file_name and "spl" not in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "u-boot.bin")
+    elif "spl-16k" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "u-boot-spl-16k.bin")
+    elif "secvm" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "secvm.bin")
+    elif "mobilevisor" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "mobilevisor.bin")
+    elif "mvconfig" in file_name:
+      dest_modem_path = os.path.join(OPTIONS.tmp_radio, "mvconfig.bin")
+
+    if dest_modem_path:
+      src_modem_path = os.path.join(OPTIONS.input_dir, file_name)
+
+    if src_modem_path and os.path.exists(src_modem_path) and os.path.exists(OPTIONS.tmp_radio):
+      #print "www src modem path: %s" % (src_modem_path)
+      #print "www dst modem path: %s" % (dest_modem_path)
+      if OPTIONS.verbose:
+        print("www copy %s to %s " % (src_modem_path, dest_modem_path))
+      shutil.copyfile(src_modem_path, dest_modem_path)
+
+  print("www list all modem bins in target")
+  for bins in os.listdir(OPTIONS.tmp_radio):
+    print ("                             %s"%(bins))
+  print "\n"
+
+
+def CreateBaseDirs():
+  OPTIONS.tmp_boot = os.path.join(OPTIONS.tmp_dir, "BOOT")
+  os.mkdir(OPTIONS.tmp_boot)
+  OPTIONS.tmp_recovery = os.path.join(OPTIONS.tmp_dir, "RECOVERY")
+  os.mkdir(OPTIONS.tmp_recovery)
+  OPTIONS.tmp_system = os.path.join(OPTIONS.tmp_dir, "SYSTEM")
+  os.mkdir(OPTIONS.tmp_system)
+  OPTIONS.tmp_vendor = os.path.join(OPTIONS.tmp_dir, "VENDOR")
+  os.mkdir(OPTIONS.tmp_vendor)
+  OPTIONS.tmp_product = os.path.join(OPTIONS.tmp_dir, "PRODUCT")
+  os.mkdir(OPTIONS.tmp_product)
+  if "socko.img" in os.listdir(OPTIONS.input_dir):
+    OPTIONS.tmp_socko = os.path.join(OPTIONS.tmp_dir, "SOCKO")
+    os.mkdir(OPTIONS.tmp_socko)
+  if "odmko.img" in os.listdir(OPTIONS.input_dir):
+    OPTIONS.tmp_odmko = os.path.join(OPTIONS.tmp_dir, "ODMKO")
+    os.mkdir(OPTIONS.tmp_odmko)
+  #OPTIONS.tmp_userdata = os.path.join(OPTIONS.tmp_dir, "USERDATA")
+  #os.mkdir(OPTIONS.tmp_userdata)
+  OPTIONS.tmp_ota = os.path.join(OPTIONS.tmp_dir, "OTA")
+  os.mkdir(OPTIONS.tmp_ota)
+  OPTIONS.tmp_radio = os.path.join(OPTIONS.tmp_dir, "RADIO")
+  os.mkdir(OPTIONS.tmp_radio)
+  OPTIONS.tmp_meta = os.path.join(OPTIONS.tmp_dir, "META")
+  os.mkdir(OPTIONS.tmp_meta)
+  OPTIONS.tmp_images = os.path.join(OPTIONS.tmp_dir, "IMAGES")
+  os.mkdir(OPTIONS.tmp_images)
+  OPTIONS.tmp_root = os.path.join(OPTIONS.tmp_dir, "ROOT")
+  os.mkdir(OPTIONS.tmp_root)
+
+def ProcessBootableImage(imgfile, target_dir, imgdir=None):
+  print("%-20s: process bootable image file " % (imgfile,))
+
+  tmpdir = tempfile.mkdtemp(prefix="bootimg-")
+  OPTIONS.tempfiles.append(tmpdir)
+
+  if OPTIONS.verbose:
+    print("unpackbootimg to dir " + tmpdir);
+
+  print "                    :copy %s to IMAGES first" % (imgfile)
+  shutil.copyfile(GetSourceFilePath(imgfile, imgdir), os.path.join(OPTIONS.tmp_images,imgfile))
+
+  cmd = ["unpack_bootimg.py", "--boot_img", GetSourceFilePath(imgfile, imgdir), "--out", tmpdir]
+
+  CommonRunWithErrStr(cmd,
+                      errorstr=("failed to unpack bootimg \"%s\"" % (imgfile,)))
+
+  #shutil.move(os.path.join(tmpdir, imgfile+"-base"), os.path.join(target_dir, "base"))
+  #shutil.move(os.path.join(tmpdir, imgfile+"-cmdline"), os.path.join(target_dir, "cmdline"))
+  #shutil.move(os.path.join(tmpdir, imgfile+"-zImage"), os.path.join(target_dir, "kernel"))
+  #shutil.move(os.path.join(tmpdir, imgfile+"-dt"), os.path.join(OPTIONS.tmp_dir, "dt.img"))
+  shutil.copyfile(os.path.join(tmpdir, "kernel"), os.path.join(target_dir, "kernel"))
+  if os.path.getsize(os.path.join(tmpdir, "ramdisk")) != 0:
+    shutil.move(os.path.join(tmpdir, "ramdisk"), os.path.join(tmpdir, "ramdisk.gz"))
+
+    tmp_ramdisk_file = os.path.join(tmpdir, "ramdisk")
+
+    tmp_ramdisk_dir = os.path.join(target_dir, "RAMDISK")
+    os.mkdir(tmp_ramdisk_dir)
+
+    cmd = ["gzip", "-d", tmp_ramdisk_file+".gz"]
+    CommonRunWithErrStr(cmd,
+        ("failed to unzip ramdisk \"%s\"" % (tmp_ramdisk_file+".gz",)))
+
+    cmd = ["cpio", "-idm"]
+    f = open(tmp_ramdisk_file, "rb")
+    ramdisk_file_data = f.read()
+    f.close()
+    CommonRunWithErrStr(cmd,
+        ("failed to cpio ramdisk \"%s\"" % (tmp_ramdisk_file,)),
+        tmp_ramdisk_dir,
+        ramdisk_file_data)
+
+  shutil.rmtree(tmpdir)
+  OPTIONS.tempfiles.remove(tmpdir)
+
+def ProcessRawImage(imgfile, target_dir, imgdir=None):
+  print("%-20s: process ext4 raw image file " % (imgfile,))
+
+  cmd = ["ext2files", "-o", target_dir, GetSourceFilePath(imgfile, imgdir)]
+  if OPTIONS.verbose:
+    cmd.append("-v")
+  CommonRunWithErrStr(cmd,
+                      ("failed to unpack ext image file \"%s\"" % (imgfile,)))
+
+  redundant_dir = os.path.join(target_dir, "lost+found")
+  if os.path.exists(redundant_dir):
+    shutil.rmtree(redundant_dir)
+
+  matrix_file = os.path.join(target_dir, "compatibility_matrix.xml")
+  manifest_file = os.path.join(target_dir, "manifest.xml")
+  if os.path.exists(matrix_file):
+    shutil.copyfile(matrix_file, os.path.join(OPTIONS.tmp_meta, os.path.splitext(imgfile)[0] + "_matrix.xml"))
+  if os.path.exists(manifest_file):
+    shutil.copyfile(manifest_file, os.path.join(OPTIONS.tmp_meta, os.path.splitext(imgfile)[0] + "_manifest.xml"))
+
+
+
+def ProcessSparseImage(imgfile, target_dir, imgdir=None):
+  print("%-20s: process ext4 sparse image file " % (imgfile,))
+
+  #print "www copy ext4 sparse img %s to IMAGES first" % (imgfile)
+  #shutil.copyfile(GetSourceFilePath(imgfile, imgdir), os.path.join(OPTIONS.tmp_images,imgfile))
+
+  tmpdir = tempfile.mkdtemp(prefix="sparseimg-")
+  #OPTIONS.tempfiles.append(tmpdir)
+
+  cmd = ["simg2img", GetSourceFilePath(imgfile, imgdir), os.path.join(tmpdir, imgfile)]
+  CommonRunWithErrStr(cmd,
+                      ("failed to process sparse image file \"%s\"" % (imgfile,)))
+
+  #block_list_file = os.path.join(OPTIONS.tmp_images, os.path.splitext(imgfile)[0]+".map")
+  #mount_point = "/"+os.path.splitext(imgfile)[0]
+
+  #print "www to generate the block list file then"
+  #cmd = ["e2fsdroid", "-B", block_list_file, "-a", mount_point,  GetSourceFilePath(imgfile, imgdir)]
+  #CommonRunWithErrStr(cmd,
+  #                    ("failed to GEN block_list file \"%s.map\"" % (imgfile,)))
+
+  ProcessRawImage(imgfile, target_dir, tmpdir)
+
+  shutil.rmtree(tmpdir)
+
+def GetIfSparseImg(imgdir):
+  f = open(imgdir,"r")
+  header_bin = f.read(28)
+  header = struct.unpack("<I4H4I", header_bin)
+  magic_number = header[0]
+  f.close()
+  if magic_number == 0xED26FF3A:
+    return True
+  else:
+    return False
+
+def GetRawAndBlocklist(imgfile, target_dir, imgdir=None):
+  print("%-20s: Get ext4 raw image file and block_list file " % (imgfile,))
+
+  is_sparse_img = GetIfSparseImg(GetSourceFilePath(imgfile, imgdir))
+  target_rawimg_path = os.path.join(target_dir,imgfile)
+  target_sparseimg_path = os.path.join(target_dir,imgfile + "_r")
+
+  if is_sparse_img:
+    print "                    : %s is a sparse img" % (imgfile)
+    shutil.copyfile(GetSourceFilePath(imgfile, imgdir), target_sparseimg_path)
+    cmd = ["simg2img", GetSourceFilePath(imgfile, imgdir), target_rawimg_path]
+    CommonRunWithErrStr(cmd,
+                      ("failed to process sparse image file \"%s\"" % (imgfile,)))
+  else:
+    print "                    : %s is a raw img" % (imgfile)
+    shutil.copyfile(GetSourceFilePath(imgfile, imgdir), target_rawimg_path)
+    cmd = ["img2simg", GetSourceFilePath(imgfile, imgdir), target_sparseimg_path]
+    CommonRunWithErrStr(cmd,
+                      ("failed to process raw image file \"%s\"" % (imgfile,)))
+
+  block_list_file = os.path.splitext(target_sparseimg_path)[0]+".map"
+  imgname = os.path.splitext(imgfile)[0]
+  if imgname == "system":
+    mount_point = "/"
+  else:
+    mount_point = "/"+imgname
+
+
+  print "                    :to generate the block list file then"
+  cmd = ["e2fsdroid", "-B", block_list_file, "-a", mount_point,  target_sparseimg_path]
+  CommonRunWithErrStr(cmd,
+                      ("failed to GEN block_list file \"%s.map\"" % (imgfile,)))
+
+  if os.path.getsize(block_list_file) == 0:
+    print "                      :to del the empty img related dirs: %s"%(imgname)
+    os.removedirs(os.path.join(OPTIONS.tmp_dir, imgname.upper()))
+
+  if os.path.exists(target_sparseimg_path):
+    print "                    :delete the sparse img because it has no use now"
+    os.remove(target_sparseimg_path)
+
+def GetSparseAndBlocklist(imgfile, target_dir, imgdir=None):
+  print("%-20s: Get ext4 sparse image file and block_list file " % (imgfile,))
+
+  is_sparse_img = GetIfSparseImg(GetSourceFilePath(imgfile, imgdir))
+  target_sparseimg_path = os.path.join(target_dir,imgfile)
+
+  if is_sparse_img:
+    print "                    :copy ext4 sparse img %s to IMAGES first" % (imgfile)
+    shutil.copyfile(GetSourceFilePath(imgfile, imgdir), target_sparseimg_path)
+  else:
+    cmd = ["img2simg", GetSourceFilePath(imgfile, imgdir), target_sparseimg_path]
+    CommonRunWithErrStr(cmd,
+                      ("failed to process sparse image file \"%s\"" % (imgfile,)))
+
+  #cmd = ["img2simg", GetSourceFilePath(imgfile, imgdir), target_sparseimg_path]
+  #CommonRunWithErrStr(cmd,
+  #                    ("failed to process sparse image file \"%s\"" % (imgfile,)))
+
+  block_list_file = os.path.splitext(target_sparseimg_path)[0]+".map"
+  imgname = os.path.splitext(imgfile)[0]
+  if imgname == "system":
+    mount_point = "/"
+  else:
+    mount_point = "/"+imgname
+
+  print "                    :to generate the block list file then"
+  cmd = ["e2fsdroid", "-B", block_list_file, "-a", mount_point,  target_sparseimg_path]
+  CommonRunWithErrStr(cmd,
+                      ("failed to GEN block_list file \"%s.map\"" % (imgfile,)))
+
+#  print "www sort block list"
+#  sort_lines = open(block_list_file).read().split("\n").sort()
+#  with open(block_list_file, "w") as f_map:
+#    f_map.truncate()
+#    for line in sort_lines:
+#      f_map.write(line)
+#      f_map.write("\n")
+#  f_map.close()
+
+
+  if is_sparse_img:
+    print "                    :not nee to copy ext4 sparse img %s to IMAGES again" % (imgfile)
+    #shutil.copyfile(GetSourceFilePath(imgfile, imgdir), target_sparseimg_path)
+  else:
+    if os.path.exists(target_sparseimg_path):
+      os.remove(target_sparseimg_path)
+    print "                    :need to Gen ext4 sparse img %s to IMAGES again" % (imgfile)
+    cmd = ["img2simg", GetSourceFilePath(imgfile, imgdir), target_sparseimg_path]
+    CommonRunWithErrStr(cmd,
+        ("failed to process sparse image file \"%s\" again" % (imgfile,)))
+
+  #print "www Get original s-img from raw in pac, desert the modification because of block_list gen"
+  #cmd = ["img2simg", GetSourceFilePath(imgfile, imgdir), target_sparseimg_path]
+  #CommonRunWithErrStr(cmd,
+  #                    ("failed to process sparse image file \"%s\" again" % (imgfile,)))
+
+def ProcessYaffsImage(imgfile, target_dir, imgdir=None):
+  print("%-20s: process yaffs image file " % (imgfile,))
+
+  cmd = ["unyaffs", GetSourceFilePath(imgfile, imgdir), "-o", target_dir]
+  if OPTIONS.verbose:
+    cmd.append("-v")
+  CommonRunWithErrStr(cmd,
+                      "failed unyaffs target file")
+
+def GetSourceFilePath(_file, srcdir=None):
+  if srcdir != None:
+    return os.path.join(srcdir, _file)
+
+  return os.path.join(OPTIONS.input_dir, _file)
+
+
+def ProcessCommonImage(imgfile, target_dir, imgdir=None):
+  try_count = 0
+  func_name = ""
+  next_name = None
+  process_ok = False
+  while (not process_ok) and try_count < 4:
+    process_ok = False
+    try_count = try_count + 1
+    try:
+      if try_count == 1:
+        func_name = "ext2files"
+        next_name = "simg2img"
+        ProcessRawImage(imgfile, target_dir, imgdir)
+      elif try_count == 2:
+        func_name = "simg2img"
+        next_name = "unyaffs"
+        ProcessSparseImage(imgfile, target_dir, imgdir)
+      elif try_count == 3:
+        func_name = "unyaffs"
+        next_name = "unubifs"
+        ProcessYaffsImage(imgfile, target_dir, imgdir)
+      elif try_count == 4:
+        func_name = "unubifs"
+        next_name = None
+        raise common.ExternalError("proccess ubifs")
+      process_ok = True
+    except common.ExternalError, e:
+      if next_name != None:
+        print ("%-20s: %s failed, try %s" % (imgfile, func_name, next_name))
+      else:
+        print ("%-20s: %s failed, error!!" % (imgfile, func_name))
+
+  if not process_ok:
+    raise common.ExternalError("%-20s: process common image error!" % (imgfile,))
+
+
+def ProcessPrebuildKeyFiles():
+  OPTIONS.misc_info = os.path.join(OPTIONS.device_dir,"common/misc_info/misc_info.txt")
+  OPTIONS.selinux_fc = os.path.join(OPTIONS.device_dir,"common/misc_info/file_contexts.bin")
+  OPTIONS.android_info = os.path.join(OPTIONS.device_dir,"common", "misc_info", "android-info.txt")
+  OPTIONS.vendor_specify_tool = os.path.join(OPTIONS.device_dir,"common", "releasetools.py")
+
+  shutil.copyfile(OPTIONS.misc_info, os.path.join(OPTIONS.tmp_meta, "misc_info.txt"))
+  shutil.copyfile(OPTIONS.selinux_fc, os.path.join(OPTIONS.tmp_meta, "file_contexts.bin"))
+  shutil.copyfile(OPTIONS.vendor_specify_tool, os.path.join(OPTIONS.tmp_meta, "releasetools.py"))
+  shutil.copyfile(OPTIONS.android_info, os.path.join(OPTIONS.tmp_ota, "android-info.txt"))
+
+def GetSuperMoImageForPtoQ(raw_superimg_dir):
+  super_metadata_only_img_path = os.path.join(OPTIONS.tmp_images, "super_mo.img")
+
+  f_superimg = open(raw_superimg_dir, "rb")
+  metadata_data = f_superimg.read(65536)
+
+  f_mo_img = open(super_metadata_only_img_path, "w+b")
+  f_mo_img.write(metadata_data)
+
+  f_superimg.close()
+  f_mo_img.close()
+
+def GetSubPartitionImagesFromSuper(superimg_name):
+  if superimg_name in os.listdir(OPTIONS.input_dir):
+    is_super_sparse = GetIfSparseImg(GetSourceFilePath(superimg_name))
+    if is_super_sparse:
+      raw_super_dir = os.path.join(OPTIONS.input_dir,os.path.splitext(superimg_name)[0] + "_raw.img")
+      cmd = ["simg2img", GetSourceFilePath(superimg_name), raw_super_dir]
+      CommonRunWithErrStr(cmd,
+                      ("failed to transfer \"%s\" to raw" % (superimg_name)))
+      print "www checkfiles after super to raw\n"
+      for filename in os.listdir(OPTIONS.input_dir):
+        print "%s\n"%(filename)
+    else:
+      raw_super_dir = os.path.join(OPTIONS.input_dir, superimg_name)
+
+    #get super metadata only img for p to q update
+    GetSuperMoImageForPtoQ(raw_super_dir)
+
+    cmd = ["lpunpack", raw_super_dir, OPTIONS.input_dir]
+    CommonRunWithErrStr(cmd,
+                      ("failed to unpack \"%s\" to sub-partition-imgs" % (superimg_name)))
+    print "www checkfiles after super unpacked\n"
+    for filename in os.listdir(OPTIONS.input_dir):
+      print "%s\n"%(filename)
+
+def ProcessSuperGroupPartitions():
+  GetSubPartitionImagesFromSuper("super.img")
+  if "system.img" in os.listdir(OPTIONS.input_dir):
+    GetRawAndBlocklist('system.img', OPTIONS.tmp_images)
+  if "vendor.img" in os.listdir(OPTIONS.input_dir):
+    GetRawAndBlocklist('vendor.img', OPTIONS.tmp_images)
+  if "product.img" in os.listdir(OPTIONS.input_dir):
+    GetRawAndBlocklist('product.img', OPTIONS.tmp_images)
+
+def ProcessAllOtherPartitions():
+  ProcessBootableImage('boot.img', OPTIONS.tmp_boot)
+  ProcessBootableImage('recovery.img', OPTIONS.tmp_recovery)
+  if "socko.img" in os.listdir(OPTIONS.input_dir):
+    GetRawAndBlocklist('socko.img', OPTIONS.tmp_images)
+  if "odmko.img" in os.listdir(OPTIONS.input_dir):
+    GetRawAndBlocklist('odmko.img', OPTIONS.tmp_images)
+    shutil.copyfile(os.path.join(OPTIONS.tmp_images, "odmko.img"), os.path.join(OPTIONS.tmp_images, "odmko_raw.img"))
+
+
+def ProcessSystemVendorPropFiles():
+  print("                    :Copy prop files for system/vendor")
+
+  recovery_rdsk_prop = os.path.join(OPTIONS.tmp_recovery, "RAMDISK", "prop.default")
+
+  if os.path.exists(recovery_rdsk_prop):
+    shutil.copyfile(recovery_rdsk_prop, os.path.join(OPTIONS.tmp_system, "build.prop"))
+    shutil.copyfile(recovery_rdsk_prop, os.path.join(OPTIONS.tmp_vendor, "build.prop"))
+    shutil.copyfile(recovery_rdsk_prop, os.path.join(OPTIONS.tmp_system, "recovery-from-boot.p"))
+
+def GetIfAvbEnabled(imgdir):
+  f = open(imgdir,"r")
+  f.seek(-64, os.SEEK_END)
+  footer_data = f.read(28)
+  footer = struct.unpack("<I4H4I", footer_data)
+  magic = footer[0]
+  f.close()
+  print ("avb Magic is: 0x%x"%(magic))
+  if magic == 0x66425641:
+    return True
+  else:
+    return False
+
+def ProcessMiscInfo():
+  ptb_xml = os.path.join(OPTIONS.tmp_radio, "partition.xml")
+  ParseXml(ptb_xml, OPTIONS.partition_list)
+  
+  misc_info_path = os.path.join(OPTIONS.tmp_meta,"misc_info.txt")
+  d_misc = LoadDictionaryFromLines(open(misc_info_path).read().split("\n"))
+
+  recovery_fstab_path = os.path.join(OPTIONS.tmp_recovery,"RAMDISK/system/etc/recovery.fstab")
+  d_fstab = LoadRecoveryFSTab(int(d_misc["fstab_version"],0), recovery_fstab_path)
+  #print d_fstab
+
+  f_misc = open(misc_info_path, "r")
+  misc_info_lines = f_misc.readlines()
+
+  get_part_size_list = ["system","cache","prodnv","vendor","boot","recovery"]
+  for misc_line in misc_info_lines:
+    for partition in OPTIONS.partition_list:
+      for get_size_part in get_part_size_list:
+        if partition.name == get_size_part:
+          if get_size_part + "_size" in misc_line:
+            index_this_line = misc_info_lines.index(misc_line)
+            if get_size_part == "cache":
+              this_part_size = int(partition.size)*1000*1000
+            else:
+              this_part_size = int(partition.size)*1024*1024
+            #print "%s partition index is %s" % (get_size_part, misc_line.index('='))
+            misc_line = misc_line[:(misc_line.index('='))+1] + str(this_part_size) + '\n'
+            misc_info_lines[index_this_line] = misc_line
+
+  if GetIfAvbEnabled(GetSourceFilePath('boot.img')):
+    avb_enabled = "true"
+  else:
+    avb_enabled = "false"
+
+  for misc_line in misc_info_lines:
+    if "avb_enable" in misc_line:
+      avb_line_index = misc_info_lines.index(misc_line)
+      avb_line = misc_line[:(misc_line.index('='))+1] + avb_enabled + '\n'
+      misc_info_lines[avb_line_index] = avb_line
+
+  f_misc = open(misc_info_path, "w")
+  f_misc.writelines(misc_info_lines)
+  f_misc.close()
+
+#  d_misc["userdata_fs_type"] = d_fstab["/data"].fs_type
+#  with open(misc_info_path, "w") as f_last:
+#    f_last.truncate()
+#    for key, value in d_misc.items():
+#      f_last.write(key + '=' + str(value))
+#      f_last.write("\n")
+#    f_last.close()
+
+def ProcessAndroidInfo():
+  #system_prop = os.path.join(OPTIONS.tmp_system, "build.prop")
+  #vendor_prop = os.path.join(OPTIONS.tmp_vendor, "build.prop")
+  recovery_rdsk_prop = os.path.join(OPTIONS.tmp_recovery, "RAMDISK", "prop.default")
+  #data = open(system_prop).read()
+  #data += open(vendor_prop).read()
+  data = open(recovery_rdsk_prop).read()
+
+  d_prop = LoadDictionaryFromLines(data.split("\n"))
+  print "                    :board info: %s" % d_prop["ro.product.board"]
+
+  android_info_file = os.path.join(OPTIONS.tmp_ota, "android-info.txt")
+
+  #if "go" in d_prop["ro.product.vendor.model"]:
+    #OPTIONS.prj_go = True
+
+  with open(android_info_file, "w") as f_last:
+    f_last.truncate()
+    f_last.write('board' + ' = ' + str(d_prop["ro.product.board"]))
+    f_last.write("\n")
+  f_last.close()
+
+def CopyOtaBins():
+  OPTIONS.ota_bin = os.path.join(OPTIONS.device_dir, OPTIONS.project_name, "ota_bin")
+  shutil.copytree(OPTIONS.ota_bin, os.path.join(OPTIONS.tmp_ota, "bin"))
+
+
+
+fsconfig_infos = {
+  "boot"      : ("BOOT/RAMDISK/",     "BOOT\/RAMDISK\/",     "",        "boot_filesystem_config.txt"),
+  "recovery"  : ("RECOVERY/RAMDISK/", "RECOVERY\/RAMDISK\/", "",        "recovery_filesystem_config.txt"),
+  "system"    : ("SYSTEM/",           "SYSTEM\/",            "system/", "filesystem_config.txt"),
+  "vendor"    : ("VENDOR/",           "VENDOR\/",            "vendor/", "vendor_filesystem_config.txt"),
+}
+
+def GenerateFsConfigInfo(section):
+  fsconfig_info = fsconfig_infos[section]
+
+  cmd = ["zipinfo", "-1", OPTIONS.output]
+  stdoutdata, stderrdata = CommonRunWithErrStr(cmd,
+                                               "failed to run zipinfo")
+
+  cmd = ["awk", "BEGIN { FS=\""+fsconfig_info[0]+"\" } /^"+fsconfig_info[1]+"/ {print \""+fsconfig_info[2]+"\" $2}"]
+  stdoutdata, stderrdata = CommonRunWithErrStr(cmd,
+                                               "failed to run awk",
+                                               stdindata=stdoutdata)
+
+  cmd = ["fs_config",]
+  stdoutdata, stderrdata = CommonRunWithErrStr(cmd,
+                                               "failed to run fs_config",
+                                               stdindata=stdoutdata)
+
+  f = open(os.path.join(OPTIONS.tmp_meta, fsconfig_info[3]), 'wb')
+  f.write(stdoutdata)
+  f.close
+
+  return os.path.join("META", fsconfig_info[3])
+
+def PackTargetFile():
+  print("package target file " + OPTIONS.output)
+  if os.path.exists(OPTIONS.output):
+    os.remove(OPTIONS.output)
+
+  cmd = ["zip", "-qry", OPTIONS.output, "."]
+  CommonRunWithErrStr(cmd,
+                      "failed pack target file",
+                      OPTIONS.tmp_dir)
+
+  cmd = ["zip", "-q", OPTIONS.output]
+  cmd.append(GenerateFsConfigInfo("boot"))
+  cmd.append(GenerateFsConfigInfo("recovery"))
+  cmd.append(GenerateFsConfigInfo("system"))
+  #cmd.append(GenerateFsConfigInfo("vendor"))
+
+  CommonRunWithErrStr(cmd,
+                      "failed pack target file",
+                      OPTIONS.tmp_dir)
+
+
+def UnpackPacTemp(filename):
+
+
+  print("www pac pkg size:")
+  print(os.path.getsize(filename))
+  if os.path.splitext(filename)[1] == ".gz":
+    print "decompress the gz file to pac"
+    decompressed_name = os.path.splitext(filename)[0]
+    gz_bak_name = os.path.splitext(filename)[0] + "_bak" + os.path.splitext(filename)[1]
+
+    print ("gen a copy of the gz file: %s"%(gz_bak_name))
+    shutil.copyfile(filename, gz_bak_name)
+
+    print ("obj name: %s"%(decompressed_name))
+    if os.path.exists(decompressed_name):
+      os.remove(decompressed_name)
+
+    cmd = ["gzip", "-d", filename]
+    CommonRunWithErrStr(cmd,
+      ("failed to decompress gz  pac package \"%s\"" % (filename)))
+    #pac_data = gzip.open(filename,"r").read()
+    #f_pac = open(decompressed_name,"w")
+    #f_pac.write(pac_data)
+    #f_pac.close
+    #open(decompressed_name,"wb").write(gzip.open(filename,"rb").read())
+    #time.sleep(3)
+    shutil.move(gz_bak_name, filename)
+    unpac_name = decompressed_name
+  else:
+    unpac_name = filename
+
+  size = os.path.getsize(unpac_name)
+  print ("pac size: %s"%(str(size)))
+
+  tmpdir = tempfile.mkdtemp(prefix="sprd-pac-")
+  OPTIONS.tempfiles.append(tmpdir)
+  unpac_tool = common.GetUnpacTool()
+  print unpac_tool
+
+  #cmd = ["sprd_pac", "-v", "-r", "-o", tmpdir, filename]
+  cmd = ["perl", unpac_tool, unpac_name, tmpdir, "-S"]
+  stdoutdata, _ = CommonRunWithErrStr(cmd,
+      ("failed to unpack input pac file: \"%s\"" % (unpac_name,)))
+  return tmpdir
+
+def ProcOutFile(outFile):
+  basename = os.path.basename(outFile)
+  dirname = os.path.dirname(outFile)
+  if not dirname:
+    dirname = "."
+  return os.path.abspath(dirname) + "/" + basename
+
+def main(argv):
+
+  def option_handler(o, a):
+    if o in ("-j" "--project"):
+      OPTIONS.project_name = a
+    else:
+      return False
+    return True
+
+  args = common.ParseOptions(argv, __doc__,
+    extra_opts="j:",
+                             extra_long_opts=["project_name=",
+                                              ],
+                             extra_option_handler=option_handler)
+
+  if len(args) != 2 or OPTIONS.project_name is None:
+    common.Usage(__doc__)
+    sys.exit(1)
+
+  _Cyan = '\033[1;34;40m'
+  print (_Cyan + "start to gen targetfiles")
+
+  OPTIONS.input = args[0]
+  if os.path.isdir(args[1]):
+    OPTIONS.output_dir = args[1]
+    OPTIONS.gen_target_zip = False
+  else:
+    OPTIONS.output = ProcOutFile(args[1])
+    OPTIONS.gen_target_zip = True
+
+  if not os.path.exists(OPTIONS.input):
+    print >> sys.stderr, "parameter error: Can't find the pac PKG!!\n"
+    sys.exit(1)
+
+
+  if os.path.isdir(OPTIONS.input):
+    OPTIONS.input_dir = OPTIONS.input
+    OPTIONS.input_is_pac = False
+  else:
+    OPTIONS.input_dir = UnpackPacTemp(OPTIONS.input)
+
+
+  if OPTIONS.gen_target_zip:
+    OPTIONS.tmp_dir = tempfile.mkdtemp(prefix="make-target-files-")
+    OPTIONS.tempfiles.append(OPTIONS.tmp_dir)
+  else:
+    OPTIONS.tmp_dir = OPTIONS.output_dir 
+
+  if OPTIONS.verbose:
+    print("target file temp dir is " + OPTIONS.tmp_dir)
+
+  CreateBaseDirs()
+
+  RenameAndCopyModemFiles()
+
+  ProcessPrebuildKeyFiles()
+
+  ProcessSuperGroupPartitions()
+
+  ProcessAllOtherPartitions()
+
+  ProcessSystemVendorPropFiles()
+
+  ProcessMiscInfo()
+
+  ProcessAndroidInfo()
+
+  CopyOtaBins()
+
+  if OPTIONS.gen_target_zip:
+    PackTargetFile()
+
+  common.Cleanup()
+
+  if os.path.splitext(OPTIONS.input)[1] == ".gz":
+    unpac_name = os.path.splitext(OPTIONS.input)[0]
+    if os.path.exists(unpac_name):
+      print "....delete the decompressed pac files....."
+      os.remove(unpac_name)
+
+  print "!!Gen Target Files DONE!!"
+
+
+if __name__ == '__main__':
+  try:
+    common.CloseInheritedPipes()
+    main(sys.argv[1:])
+  except common.ExternalError, e:
+    print
+    print "   ERROR: %s" % (e,)
+    print
+    sys.exit(1)

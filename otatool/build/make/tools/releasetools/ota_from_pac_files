@@ -1,0 +1,268 @@
+#!/bin/bash
+
+THIS_CMD=`basename $0`
+THIS_DIR=`dirname $0`
+
+OLD_OVERLAY_DIR=
+NEW_OVERLAY_DIR=
+OLD_INPUT=
+NEW_INPUT=
+OUTPUT_PKG=
+
+OLD_TARGET_FILE=
+NEW_TARGET_FILE=
+OLD_TARGET_DIR=
+NEW_TARGET_DIR=
+NEW_TARGET= 
+OLD_TARGET= 
+
+TARGET_PRODUCT=
+MAKE_TARGET=$THIS_DIR/target_files_from_pac
+MAKE_OTA=$THIS_DIR/ota_from_target_files.py
+
+ENABLE_VERBOSE="false"
+
+WIPE_USER_DATA="false"
+REPART_DURING_INSTALL="false"
+
+MENU_PRODUCT=
+PKG_SIGN_KEY=
+ALL_PRODUCTS="sharkl3 sharkl5pro sharkle pike2"
+
+#COMMON_OPTIONS="-p prebuilts/linux-x86/ota"
+COMMON_OPTIONS=
+TARGET_COMMON_OPTIONS=
+#OTA_COMMON_OPTIONS="--block -2"
+OTA_COMMON_OPTIONS="--block"
+INCREMENTAL_OPTIONS=
+
+function help_info
+{
+  echo "Tool for generate update package from pac file"
+  echo
+  echo "Usage: $THIS_CMD [-d] [-w] [-r] [-z] <-p product_name> <-k signkey> <-b input> <-t input>  <update_pkg>"
+  echo "       $THIS_CMD [-d] [-w] [-r] [-z] <-p product_name> <-k signkey> <-t input> <update_pkg>"
+  echo "       $THIS_CMD -h"
+  echo
+  echo "  -p   product_name             product name to get nvmergecfg and modemcfg etc."
+  echo "                           name must be follow list which should be lowercase:"
+  echo "                           sharkl3"
+  echo "                           sharkle"
+  echo "                           pike2"
+  echo "                           sharkl5pro"
+  echo
+  echo "  -k   the key to sign the ota package. usually user the release key to sign user version"
+  echo
+  echo "  -d   gen the downgrade delta pkg,update from a newer version to an older version which will wipe the userdata"
+  echo
+  echo "  -w   wipe user data. Generate an OTA package that will wipe the user data partition when installed"
+  echo
+  echo "  -r   Gen the full pkg which will repart during the updating"
+  echo
+  echo "  -z   Gen the target.zip file during make ota pkg, without this para, it will not gen target file"
+  echo
+  echo "  -v   Show command lines being executed."
+  echo
+  echo "  -t   input           target input"
+  echo "  -b   input           base input"
+  echo
+  echo "   input           the pac file for the usb downloader, sprd called it Reseachdownloader"
+  echo
+  echo "   update_pkg      the Full or delta ota package which to be generated"
+}
+
+function gettop
+{ 
+    local TOPFILE=build/tools/releasetools/ota_from_target_files.py;
+    if [ -n "$TOP" -a -f "$TOP/$TOPFILE" ]; then
+        echo $TOP;
+    else
+        if [ -f $TOPFILE ]; then
+            PWD= /bin/pwd;
+        else
+            local HERE=$PWD;
+            T=;
+            while [ \( ! \( -f $TOPFILE \) \) -a \( $PWD != "/" \) ]; do
+                cd .. > /dev/null;
+                T=`PWD= /bin/pwd`;
+            done;
+            cd $HERE > /dev/null;
+            if [ -f "$T/$TOPFILE" ]; then
+                echo $T;
+            fi;
+        fi;
+    fi
+}
+
+while [[ "$1" != "" ]]
+do
+  CUR_ARG=$1
+  TEMP_ARG=${CUR_ARG/-/#}
+  echo "$TEMP_ARG" | grep "^#[pkbitvwzrdh]" >/dev/null
+  if [[ $? == 0 ]] ; then
+    if [[ "$1" == "-b" ]] ; then
+      shift
+      OLD_INPUT="$1"
+    elif [[ "$1" == "-p" ]] ; then
+      shift
+      MENU_PRODUCT="$1"
+    elif [[ "$1" == "-k" ]] ; then
+      shift
+      PKG_SIGN_KEY="$1"
+    elif [[ "$1" == "-t" ]] ; then
+      shift
+      NEW_INPUT="$1"
+    elif [[ "$1" == "-v" ]] ; then
+      ENABLE_VERBOSE="true"
+    elif [[ "$1" == "-w" ]] ; then
+      WIPE_USER_DATA="true"
+    elif [[ "$1" == "-r" ]] ; then
+      REPART_DURING_INSTALL="true"
+    elif [[ "$1" == "-z" ]] ; then
+      GEN_TARGET_ZIP="true"
+    elif [[ "$1" == "-d" ]] ; then
+      DOWNGRADE_UPDATE="true"
+    elif [[ "$1" == "-h" ]] ; then
+      help_info
+      exit 0
+    fi
+  else
+    if [[ "$CUR_ARG" != "" && ${CUR_ARG:0:1} == "-" ]] ; then
+        echo "error parameter $1"
+        help_info
+        exit 1
+    else
+      OUTPUT_PKG=$1
+    fi
+  fi
+  shift
+done
+
+if [[ "$MENU_PRODUCT" != "" ]] ; then
+  VALID_PRODUCT=
+  for p in $ALL_PRODUCTS
+  do
+    if [[ $p == $MENU_PRODUCT ]] ; then
+      VALID_PRODUCT=$MENU_PRODUCT
+      break;
+    fi
+  done
+  if [[ "$VALID_PRODUCT" == "" ]] ; then
+    echo "given product '$MENU_PRODUCT' is not valid !!!" >&2
+    help_info
+    exit 1
+  else
+    TARGET_PRODUCT=$VALID_PRODUCT
+  fi
+fi
+#TARGET_COMMON_OPTIONS="-m device/sprd/$TARGET_PRODUCT/misc_info.txt -b device/sprd/common/ota_bin -a device/sprd/$TARGET_PRODUCT/android-info.txt"
+if [[ "$TARGET_PRODUCT" != "" ]] ; then
+  TARGET_COMMON_OPTIONS="-j $TARGET_PRODUCT"
+fi
+
+if [[ "$NEW_INPUT" == "" || "$OUTPUT_PKG" == "" ]] ; then
+  echo "input and update_pkg must be given!!!" >&2
+  help_info
+  exit 1
+fi
+
+if [[ "$WIPE_USER_DATA" == "true" ]] ; then
+  OTA_COMMON_OPTIONS="$OTA_COMMON_OPTIONS --wipe_user_data"
+fi
+
+if [[ "$REPART_DURING_INSTALL" == "true" ]] ; then
+  OTA_COMMON_OPTIONS="$OTA_COMMON_OPTIONS --repart"
+fi
+
+if [[ "$DOWNGRADE_UPDATE" == "true" ]] ; then
+  OTA_COMMON_OPTIONS="$OTA_COMMON_OPTIONS --downgrade"
+fi
+
+if [[ "$PKG_SIGN_KEY" != "" ]] ; then
+  OTA_COMMON_OPTIONS="$OTA_COMMON_OPTIONS -k $PKG_SIGN_KEY"
+fi
+
+TEMP_DIR=`mktemp -d "/tmp/ota-from-pac-XXXXXX"`
+TOP=$(gettop)
+
+function my_exit
+{
+  if [[ "$TEMP_DIR" != "" ]] ; then
+    rm -rf "$TEMP_DIR"
+  fi
+  exit $1
+}
+
+if [[ "$ENABLE_VERBOSE" == "true" ]] ; then
+  COMMON_OPTIONS="$COMMON_OPTIONS -v"
+fi
+
+NEW_TARGET_FILE=$TEMP_DIR/new_targetfile.zip
+NEW_TARGET_DIR=$TEMP_DIR/new_targetfile_dir/
+
+if [[ "$GEN_TARGET_ZIP" != "" ]] ; then
+	NEW_TARGET=$NEW_TARGET_FILE
+else
+	NEW_TARGET=$NEW_TARGET_DIR
+	mkdir $NEW_TARGET
+fi
+
+if [[ "$OLD_INPUT" != "" ]] ; then
+	OLD_TARGET_FILE=$TEMP_DIR/old_targetfile.zip
+	OLD_TARGET_DIR=$TEMP_DIR/old_targetfile_dir/
+	if [[ "$GEN_TARGET_ZIP" != "" ]] ; then
+		OLD_TARGET=$OLD_TARGET_FILE
+		#INCREMENTAL_OPTIONS="-i $OLD_TARGET_FILE"
+		INCREMENTAL_OPTIONS="-i $OLD_TARGET"
+	else
+		OLD_TARGET=$OLD_TARGET_DIR
+		mkdir $OLD_TARGET
+		#INCREMENTAL_OPTIONS="-i $OLD_TARGET_FILE"
+		INCREMENTAL_OPTIONS="-i $OLD_TARGET --extracted_input_target_files $NEW_TARGET"
+	fi
+
+	#  echo $MAKE_TARGET $COMMON_OPTIONS $TARGET_COMMON_OPTIONS $OLD_INPUT $OLD_TARGET_FILE
+	#  $MAKE_TARGET $COMMON_OPTIONS $TARGET_COMMON_OPTIONS $OLD_INPUT $OLD_TARGET_FILE
+	echo $MAKE_TARGET $COMMON_OPTIONS $TARGET_COMMON_OPTIONS $OLD_INPUT $OLD_TARGET
+	$MAKE_TARGET $COMMON_OPTIONS $TARGET_COMMON_OPTIONS $OLD_INPUT $OLD_TARGET
+	RES=$?
+	if [[ $RES != 0 ]] ; then
+		my_exit $RES
+	fi
+else
+	if [[ "$GEN_TARGET_ZIP" == "" ]] ; then
+		INCREMENTAL_OPTIONS="--extracted_input_target_files $NEW_TARGET"
+	fi
+	
+fi
+
+NEW_OVERLAY_OPTION=
+
+echo $MAKE_TARGET $COMMON_OPTIONS $TARGET_COMMON_OPTIONS $NEW_INPUT $NEW_TARGET
+$MAKE_TARGET $COMMON_OPTIONS $TARGET_COMMON_OPTIONS $NEW_INPUT $NEW_TARGET
+RES=$?
+if [[ $RES != 0 ]] ; then
+  my_exit $RES
+fi
+
+echo $MAKE_OTA $COMMON_OPTIONS $OTA_COMMON_OPTIONS $INCREMENTAL_OPTIONS $NEW_TARGET $OUTPUT_PKG
+$MAKE_OTA $COMMON_OPTIONS $OTA_COMMON_OPTIONS $INCREMENTAL_OPTIONS $NEW_TARGET $OUTPUT_PKG
+RES=$?
+if [[ $RES != 0 ]] ; then
+  my_exit $RES
+fi
+
+if [[ "$GEN_TARGET_ZIP" != "" ]] ; then
+	if [[ "$OLD_INPUT" != "" ]] ; then
+		mv $OLD_TARGET ./
+	fi
+	mv $NEW_TARGET ./
+fi
+
+RES=$?
+if [[ $RES != 0 ]] ; then
+  my_exit $RES
+fi
+
+my_exit 0
+

@@ -1,0 +1,86 @@
+此工具能使用target包和pac包制作生成ota升级包，包括差分包和整包，另外使用pac包还能产生版本pac包对应的target包。
+
+使用说明如下：
+
+****************************************************
+****************************************************
+./build/make/tools/releasetools/ota_from_target_files说明
+****************************************************
+****************************************************
+1、通过target文件制作升级包脚本：./build/make/tools/releasetools/ota_from_target_files
+    1）此脚本是原生制作升级包的脚本
+    2）此脚本及其调用的其它工具均从源码库中提取
+    3）工具包中此脚本与代码库中脚本略有不同，主要是进行了使用pac包制作ota升级包的兼容处理
+    4）此工具目前仅能在linux上运行
+
+2、命令如下：
+  ./build/make/tools/releasetools/ota_from_target_files [flags] input_target_files output_ota_package
+  1）制作整体升级包
+    ./build/make/tools/releasetools/ota_from_target_files --block -k sign_key target.zip full_update.zip
+  2）制作差分升级包
+    ./build/make/tools/releasetools/ota_from_target_files --block -k sign_key -i target_base.zip target_target.zip delta_base-to-target.zip
+  3）同android版本分区变化ota整包或者跨android大版本（7.0~8.1）分区变化的ota整包
+    ./build/make/tools/releasetools/ota_from_target_files --block --repart -k sign_key target_8.1.zip full_update_repart.zip
+  4）制作降级的差分包,即新版本升级到旧版本的升级
+    ./build/make/tools/releasetools/ota_from_target_files --block --downgrade -k sign_key -i target_newer_build.zip target_old_build.zip delta_downgrade.zip
+
+3、参数名词说明
+sign_key：                  user版本为build/target/product/security/release/releasekey
+                            userdebug版本为build/target/product/security/testkey
+target_base.zip：           基准版本target包
+target_target.zip：         目标版本target包
+delta_base-to-target.zip：  基准版本到目标版本的差分升级包
+full_update.zip：           目标版本整包
+full_update_repart.zip：    目标版本分区变更的ota整包
+
+
+
+
+****************************************************
+****************************************************
+./build/make/tools/releasetools/ota_from_pac_files说明
+****************************************************
+****************************************************
+1、通过pac包制作升级包的脚本：./build/make/tools/releasetools/ota_from_pac_files
+    1）此脚本使用的一些工具一部分来自代码库中编译出来，一部分来自开源工具
+    2）此脚本为目前9.0各项目通用脚本，任何一个项目的任何一个pac包或者两个pac包都可以做出升级包，
+	3）此工具目前仅能在linux上运行
+
+2、命令如下
+  ./build/make/tools/releasetools/ota_from_pac_files [-d] [-w] [-r] [-z] <-p product_name> <-k sign_key> [-b pac_base] <-t pac_target>  <update_pkg>
+  1）制作整体升级包
+    ./build/make/tools/releasetools/ota_from_pac_files -p product_name -k sign_key -t pac_target full_update.zip
+  2）制作差分升级包
+    ./build/make/tools/releasetools/ota_from_pac_files -p product_name -k sign_key -b pac_base -t pac_target delta_base-to-target.zip
+  3）产生降级差分升级包
+    ./build/make/tools/releasetools/ota_from_pac_files -d -p product_name -k sign_key -b pac_newer_build -t pac_oldrget delta_update_newer-to-old.zip
+    即加上-d选项即可
+  4）产生p to q 大版本整包升级包
+    ./build/make/tools/releasetools/ota_from_pac_files -r -p product_name -k sign_key  -t pac_target full_update_for_P-Q.zip
+
+3、参数说明和特殊备注：
+参数说明：
+   sign_key：                  user版本为build/target/product/security/release/releasekey
+                               userdebug版本为build/target/product/security/testkey
+   delta_base-to-target.zip：  基准版本到目标版本的差分升级包
+   full_update.zip：           目标版本整包
+   full_update_repart.zip：    目标版本分区变更的ota整包
+   product_name：              base对应的项目名称，只能是小写：sharkl3 sharkle pike2 sharkl5pro 
+   pac_base：                  基准版本pac包，即可为.gz的压缩格式，也可为.pac的非压缩格式
+   pac_target:                 目标版本pac包，压缩非压缩皆可
+
+特殊备注：
+   A 如果加入参数"-z"，产生的target包会在脚本根目录下，名字分别为：
+     old_targetfile.zip pac_base对应的target包
+     new_targetfile.zip pac_target对应的target包
+     由于各商家pac包命名规则不一致，无法批处理改为理想的名字，请手动改为对应版本号的名字并保存
+   B 如果pac包是非压缩的，则省去解压时间，会比gz压缩格式的要做包快一些,但是会牺牲存储空间
+     如果产生target包，由于需要zip压缩各种大img文件，时间会比不产生target包慢5倍
+     以1.6G的pac包打包为例，各种情况打包（此处为差分包）时间为：
+     ===================================
+     PAC(1686M)+NoTarget	1.23m（83S）
+     GZ(681M)+NoTarget	    1.57m（117S）
+     PAC+Target	        5.53m（353S）
+     GZ+Target	            6.21m（381S）
+     ===================================
+   C 无论用target包还是pac产生升级包，加入"-w"参数会产生清空userdata分区的升级包，此参数慎加，应用场景较少。 
